@@ -1,0 +1,1641 @@
+# .github/workflows/build-uup-iso.yml
+name: Build Windows ISO with Virtual Editions
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: '搜索关键词，如 "Windows 11 24H2" 或 "Windows 11 25H2"'
+        required: true
+        default: 'Windows 11 24H2'
+      architecture:
+        description: 'CPU 架构'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+      language:
+        description: '语言代码，如 zh-cn、en-us'
+        required: true
+        default: 'zh-cn'
+      base_edition:
+        description: '基础版本（决定下载哪个 UUP 包）'
+        required: true
+        default: 'Professional'
+        type: choice
+        options:
+          - Home
+          - Professional
+          - Home;Professional
+      virtual_editions:
+        description: '要创建的虚拟版本（用分号分隔，留空则只生成基础版本）'
+        required: false
+        default: 'Enterprise;Education;IoTEnterprise'
+      use_esd:
+        description: '使用 ESD 压缩（减小体积）'
+        type: boolean
+        default: true
+      netfx3:
+        description: '集成 .NET Framework 3.5'
+        type: boolean
+        default: false
+      include_updates:
+        description: '集成最新累积更新'
+        type: boolean
+        default: true
+      cleanup:
+        description: '转换后清理临时文件'
+        type: boolean
+        default: true
+
+jobs:
+  build-iso:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      # ==========================================
+      # 1. 环境准备
+      # ==========================================
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          # GitHub Windows runner 默认约 14GB 空闲，UUP 需要 20GB+
+          Write-Host "清理磁盘空间..."
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+          
+          # 删除不需要的大型组件
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Program Files\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Java_*"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Ruby"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\go"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\ProgramData\chocolatey\lib"
+          
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. 查询 UUP dump API 获取构建信息
+      # ==========================================
+      - name: Query UUP dump API
+        id: uup_query
+        shell: pwsh
+        run: |
+          $search = "${{ github.event.inputs.search_query }}"
+          $arch = "${{ github.event.inputs.architecture }}"
+          
+          Write-Host "搜索构建: $search, 架构: $arch"
+          
+          # 调用 listid API 搜索构建
+          $apiUrl = "https://api.uupdump.net/listid.php?search=" + [Uri]::EscapeDataString($search)
+          $response = Invoke-RestMethod -Uri $apiUrl -Method Get -MaximumRetryCount 3
+          
+          if ($response.responseJSON.builds.Count -eq 0) {
+            throw "未找到匹配的构建，请检查搜索关键词"
+          }
+          
+          # 筛选匹配的架构
+          $build = $response.responseJSON.builds | Where-Object { 
+            $_.architecture -eq $arch -or $arch -eq 'amd64' -and $_.architecture -eq 'x64'
+          } | Select-Object -First 1
+          
+          if (-not $build) {
+            $build = $response.responseJSON.builds | Select-Object -First 1
+          }
+          
+          $buildId = $build.updateId
+          $buildName = $build.title
+          $buildNum = $build.build
+          
+          Write-Host "找到构建: $buildName (ID: $buildId)"
+          Write-Output "build_id=$buildId" >> $env:GITHUB_OUTPUT
+          Write-Output "build_name=$buildName" >> $env:GITHUB_OUTPUT
+          Write-Output "build_num=$buildNum" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 3. 查询可用语言和版本
+      # ==========================================
+      - name: Verify language and edition
+        id: verify
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ github.event.inputs.language }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 查询可用语言
+          $langApi = "https://api.uupdump.net/listlangs.php?updateId=$buildId"
+          $langResp = Invoke-RestMethod -Uri $langApi -Method Get
+          $availableLangs = $langResp.responseJSON.langs
+          
+          if (-not ($availableLangs | Where-Object { $_.lang -eq $lang })) {
+            Write-Warning "语言 $lang 不可用，可用语言: $($availableLangs.lang -join ', ')"
+            throw "语言不可用"
+          }
+          
+          # 查询可用版本
+          $edApi = "https://api.uupdump.net/listeditions.php?lang=$lang&updateId=$buildId"
+          $edResp = Invoke-RestMethod -Uri $edApi -Method Get
+          $availableEds = $edResp.responseJSON.editions
+          
+          Write-Host "可用版本: $($availableEds -join ', ')"
+          
+          # 验证基础版本是否可用
+          $baseEds = $edition -split ';'
+          foreach ($ed in $baseEds) {
+            if (-not ($availableEds -contains $ed)) {
+              Write-Warning "版本 $ed 不可用"
+            }
+          }
+          
+          Write-Output "lang=$lang" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 4. 获取 UUP 下载包
+      # ==========================================
+      - name: Download UUP package
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ steps.verify.outputs.lang }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 调用 get API 获取下载包信息
+          $getApi = "https://api.uupdump.net/get.php?lang=$lang&edition=$edition&id=$buildId"
+          Write-Host "获取下载包: $getApi"
+          $getResp = Invoke-RestMethod -Uri $getApi -Method Get
+          
+          # 获取下载包 ZIP 的直链
+          $downloadUrl = $getResp.responseJSON.downloadUrl
+          if (-not $downloadUrl) {
+            # 备用：构造 uupdump.net 的下载链接
+            $downloadUrl = "https://uupdump.net/get.php?id=$buildId&pack=$lang&edition=$edition"
+          }
+          
+          Write-Host "下载包 URL: $downloadUrl"
+          
+          # 创建输出目录
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\uup-work"
+          Set-Location "$env:GITHUB_WORKSPACE\uup-work"
+          
+          # 下载 ZIP 包
+          $zipFile = "$env:GITHUB_WORKSPACE\uup-work\uup_download.zip"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile -MaximumRetryCount 3
+          
+          # 解压
+          Expand-Archive -Path $zipFile -DestinationPath "$env:GITHUB_WORKSPACE\uup-work" -Force
+          Remove-Item $zipFile
+          
+          # 列出解压后的文件
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work"
+
+      # ==========================================
+      # 5. 下载 UUP 文件
+      # ==========================================
+      - name: Download UUP files
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-work
+          
+          REM 查找下载脚本
+          if exist uup_download_windows.cmd (
+            call uup_download_windows.cmd
+          ) else if exist uup_download.cmd (
+            call uup_download.cmd
+          ) else (
+            echo 未找到下载脚本
+            dir
+            exit /b 1
+          )
+
+      # ==========================================
+      # 6. 下载 uup-converter-wimlib 工具
+      # ==========================================
+      - name: Download uup-converter-wimlib
+        shell: pwsh
+        run: |
+          # 从 GitHub 获取最新版
+          $converterUrl = "https://github.com/abbodi1406/BatUtil/raw/master/uup-converter-wimlib/uup-converter-wimlib.7z"
+          $converterPath = "$env:GITHUB_WORKSPACE\uup-converter-wimlib.7z"
+          
+          Write-Host "下载 uup-converter-wimlib..."
+          Invoke-WebRequest -Uri $converterUrl -OutFile $converterPath -MaximumRetryCount 3
+          
+          # 解压（需要 7z）
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+            $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          }
+          
+          & $sevenZip x $converterPath -o"$env:GITHUB_WORKSPACE\uup-converter-wimlib" -y
+          Remove-Item $converterPath
+          
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+
+      # ==========================================
+      # 7. 配置转换选项
+      # ==========================================
+      - name: Configure conversion options
+        shell: pwsh
+        run: |
+          $workDir = "$env:GITHUB_WORKSPACE\uup-work"
+          $converterDir = "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+          
+          # 创建 ConvertConfig.ini 配置文件
+          $config = @"
+          [Options]
+          ; 1 = WIM, 2 = ESD
+          Compress=$($env:USE_ESD -eq 'true' ? '2' : '1')
+          ; 集成更新
+          AddUpdates=$($env:INCLUDE_UPDATES -eq 'true' ? '1' : '0')
+          ; 清理组件
+          CleanupImage=$($env:CLEANUP -eq 'true' ? '1' : '0')
+          ; 集成 .NET 3.5
+          NetFx3=$($env:NETFX3 -eq 'true' ? '1' : '0')
+          ; 启动 ISO
+          StartISO=1
+          ; 保留临时文件（调试用）
+          Preserve=0
+          "@
+          
+          $config | Out-File -FilePath "$converterDir\ConvertConfig.ini" -Encoding UTF8
+          
+          Write-Host "转换配置:"
+          Get-Content "$converterDir\ConvertConfig.ini"
+
+      # ==========================================
+      # 8. 执行 UUP → ISO 转换
+      # ==========================================
+      - name: Convert UUP to ISO
+        shell: cmd
+        timeout-minutes: 90
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 运行转换脚本，传入 UUP 文件目录
+          call convert-UUP.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 9. 创建虚拟版本（Enterprise、Education、IoTEnterprise 等）
+      # ==========================================
+      - name: Create virtual editions
+        if: github.event.inputs.virtual_editions != ''
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 查找生成的 ISO 或 WIM 文件
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.iso) do set "SOURCE_ISO=%%f"
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.wim) do set "SOURCE_WIM=%%f"
+          
+          if defined SOURCE_ISO (
+            echo 找到源 ISO: %SOURCE_ISO%
+            REM create_virtual_editions 需要 WIM，如果源是 ISO 需要先提取
+          ) else if defined SOURCE_WIM (
+            echo 找到源 WIM: %SOURCE_WIM%
+            set "SOURCE_IMAGE=%SOURCE_WIM%"
+          )
+          
+          REM 运行虚拟版本创建脚本
+          REM 支持的虚拟版本: Enterprise, Education, IoTEnterprise, EnterpriseN, EducationN, etc.
+          call create_virtual_editions.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 10. 整理输出文件
+      # ==========================================
+      - name: Organize output
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          New-Item -ItemType Directory -Force -Path $outputDir
+          
+          # 移动所有 ISO 到输出目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work" -Filter "*.iso" | Move-Item -Destination $outputDir
+          
+          # 也检查 uup-converter-wimlib 目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib" -Filter "*.iso" -ErrorAction SilentlyContinue | Move-Item -Destination $outputDir
+          
+          # 计算 SHA256
+          Get-ChildItem $outputDir -Filter "*.iso" | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $($_.Name)" | Out-File -FilePath "$outputDir\$($_.BaseName).sha256.txt"
+          }
+          
+          Get-ChildItem $outputDir
+
+      # ==========================================
+      # 11. 分割 ISO（GitHub Release 单文件限制 2GB）
+      # ==========================================
+      - name: Split ISO for Release
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          $splitDir = "$env:GITHUB_WORKSPACE\split"
+          New-Item -ItemType Directory -Force -Path $splitDir
+          
+          $isos = Get-ChildItem $outputDir -Filter "*.iso"
+          foreach ($iso in $isos) {
+            $size = $iso.Length
+            if ($size -gt 2GB) {
+              Write-Host "分割 $($iso.Name) ($([math]::Round($size/1GB,2)) GB)..."
+              
+              # 使用 7z 分卷压缩，每卷 1900MB
+              $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+              & $sevenZip a -v1900m "$splitDir\$($iso.BaseName).7z" $iso.FullName
+              
+              # 同时保留原始 ISO 的 SHA256
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+              
+              # 创建合并脚本
+              $mergeScript = @"
+          @echo off
+          echo Merging $($iso.Name)...
+          copy /b "$($iso.BaseName).7z.001" + "$($iso.BaseName).7z.002" + "$($iso.BaseName).7z.003" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.004" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.004" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.005" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.005" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          echo Done: $($iso.Name)
+          pause
+          "@
+              $mergeScript | Out-File -FilePath "$splitDir\merge-$($iso.BaseName).bat" -Encoding OEM
+            } else {
+              # 小于 2GB 直接复制
+              Copy-Item $iso.FullName $splitDir
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+            }
+          }
+          
+          Get-ChildItem $splitDir
+
+      # ==========================================
+      # 12. 上传到 GitHub Release
+      # ==========================================
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: iso-${{ github.run_number }}-${{ steps.uup_query.outputs.build_num }}
+          name: "Windows ISO ${{ steps.uup_query.outputs.build_name }}"
+          body: |
+            ## Windows ISO 构建结果
+            
+            | 项目 | 值 |
+            |------|-----|
+            | 构建 | ${{ steps.uup_query.outputs.build_name }} |
+            | 架构 | ${{ github.event.inputs.architecture }} |
+            | 语言 | ${{ github.event.inputs.language }} |
+            | 基础版本 | ${{ github.event.inputs.base_edition }} |
+            | 虚拟版本 | ${{ github.event.inputs.virtual_editions }} |
+            | ESD 压缩 | ${{ github.event.inputs.use_esd }} |
+            | .NET 3.5 | ${{ github.event.inputs.netfx3 }} |
+            | 集成更新 | ${{ github.event.inputs.include_updates }} |
+            
+            ### 使用说明
+            
+            **如果 ISO 被分割：**
+            1. 下载所有 `.7z.00x` 文件
+            2. Windows: 双击 `merge-*.bat` 自动合并
+            3. 或使用 7-Zip 直接解压 `.7z.001` 文件
+            
+            **SHA256 校验：**
+            下载对应的 `.sha256.txt` 文件验证完整性。
+          files: |
+            split/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# .github/workflows/build-uup-iso.yml
+name: Build Windows ISO with Virtual Editions
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: '搜索关键词，如 "Windows 11 24H2" 或 "Windows 11 25H2"'
+        required: true
+        default: 'Windows 11 24H2'
+      architecture:
+        description: 'CPU 架构'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+      language:
+        description: '语言代码，如 zh-cn、en-us'
+        required: true
+        default: 'zh-cn'
+      base_edition:
+        description: '基础版本（决定下载哪个 UUP 包）'
+        required: true
+        default: 'Professional'
+        type: choice
+        options:
+          - Home
+          - Professional
+          - Home;Professional
+      virtual_editions:
+        description: '要创建的虚拟版本（用分号分隔，留空则只生成基础版本）'
+        required: false
+        default: 'Enterprise;Education;IoTEnterprise'
+      use_esd:
+        description: '使用 ESD 压缩（减小体积）'
+        type: boolean
+        default: true
+      netfx3:
+        description: '集成 .NET Framework 3.5'
+        type: boolean
+        default: false
+      include_updates:
+        description: '集成最新累积更新'
+        type: boolean
+        default: true
+      cleanup:
+        description: '转换后清理临时文件'
+        type: boolean
+        default: true
+
+jobs:
+  build-iso:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      # ==========================================
+      # 1. 环境准备
+      # ==========================================
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          # GitHub Windows runner 默认约 14GB 空闲，UUP 需要 20GB+
+          Write-Host "清理磁盘空间..."
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+          
+          # 删除不需要的大型组件
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Program Files\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Java_*"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Ruby"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\go"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\ProgramData\chocolatey\lib"
+          
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. 查询 UUP dump API 获取构建信息
+      # ==========================================
+      - name: Query UUP dump API
+        id: uup_query
+        shell: pwsh
+        run: |
+          $search = "${{ github.event.inputs.search_query }}"
+          $arch = "${{ github.event.inputs.architecture }}"
+          
+          Write-Host "搜索构建: $search, 架构: $arch"
+          
+          # 调用 listid API 搜索构建
+          $apiUrl = "https://api.uupdump.net/listid.php?search=" + [Uri]::EscapeDataString($search)
+          $response = Invoke-RestMethod -Uri $apiUrl -Method Get -MaximumRetryCount 3
+          
+          if ($response.responseJSON.builds.Count -eq 0) {
+            throw "未找到匹配的构建，请检查搜索关键词"
+          }
+          
+          # 筛选匹配的架构
+          $build = $response.responseJSON.builds | Where-Object { 
+            $_.architecture -eq $arch -or $arch -eq 'amd64' -and $_.architecture -eq 'x64'
+          } | Select-Object -First 1
+          
+          if (-not $build) {
+            $build = $response.responseJSON.builds | Select-Object -First 1
+          }
+          
+          $buildId = $build.updateId
+          $buildName = $build.title
+          $buildNum = $build.build
+          
+          Write-Host "找到构建: $buildName (ID: $buildId)"
+          Write-Output "build_id=$buildId" >> $env:GITHUB_OUTPUT
+          Write-Output "build_name=$buildName" >> $env:GITHUB_OUTPUT
+          Write-Output "build_num=$buildNum" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 3. 查询可用语言和版本
+      # ==========================================
+      - name: Verify language and edition
+        id: verify
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ github.event.inputs.language }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 查询可用语言
+          $langApi = "https://api.uupdump.net/listlangs.php?updateId=$buildId"
+          $langResp = Invoke-RestMethod -Uri $langApi -Method Get
+          $availableLangs = $langResp.responseJSON.langs
+          
+          if (-not ($availableLangs | Where-Object { $_.lang -eq $lang })) {
+            Write-Warning "语言 $lang 不可用，可用语言: $($availableLangs.lang -join ', ')"
+            throw "语言不可用"
+          }
+          
+          # 查询可用版本
+          $edApi = "https://api.uupdump.net/listeditions.php?lang=$lang&updateId=$buildId"
+          $edResp = Invoke-RestMethod -Uri $edApi -Method Get
+          $availableEds = $edResp.responseJSON.editions
+          
+          Write-Host "可用版本: $($availableEds -join ', ')"
+          
+          # 验证基础版本是否可用
+          $baseEds = $edition -split ';'
+          foreach ($ed in $baseEds) {
+            if (-not ($availableEds -contains $ed)) {
+              Write-Warning "版本 $ed 不可用"
+            }
+          }
+          
+          Write-Output "lang=$lang" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 4. 获取 UUP 下载包
+      # ==========================================
+      - name: Download UUP package
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ steps.verify.outputs.lang }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 调用 get API 获取下载包信息
+          $getApi = "https://api.uupdump.net/get.php?lang=$lang&edition=$edition&id=$buildId"
+          Write-Host "获取下载包: $getApi"
+          $getResp = Invoke-RestMethod -Uri $getApi -Method Get
+          
+          # 获取下载包 ZIP 的直链
+          $downloadUrl = $getResp.responseJSON.downloadUrl
+          if (-not $downloadUrl) {
+            # 备用：构造 uupdump.net 的下载链接
+            $downloadUrl = "https://uupdump.net/get.php?id=$buildId&pack=$lang&edition=$edition"
+          }
+          
+          Write-Host "下载包 URL: $downloadUrl"
+          
+          # 创建输出目录
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\uup-work"
+          Set-Location "$env:GITHUB_WORKSPACE\uup-work"
+          
+          # 下载 ZIP 包
+          $zipFile = "$env:GITHUB_WORKSPACE\uup-work\uup_download.zip"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile -MaximumRetryCount 3
+          
+          # 解压
+          Expand-Archive -Path $zipFile -DestinationPath "$env:GITHUB_WORKSPACE\uup-work" -Force
+          Remove-Item $zipFile
+          
+          # 列出解压后的文件
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work"
+
+      # ==========================================
+      # 5. 下载 UUP 文件
+      # ==========================================
+      - name: Download UUP files
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-work
+          
+          REM 查找下载脚本
+          if exist uup_download_windows.cmd (
+            call uup_download_windows.cmd
+          ) else if exist uup_download.cmd (
+            call uup_download.cmd
+          ) else (
+            echo 未找到下载脚本
+            dir
+            exit /b 1
+          )
+
+      # ==========================================
+      # 6. 下载 uup-converter-wimlib 工具
+      # ==========================================
+      - name: Download uup-converter-wimlib
+        shell: pwsh
+        run: |
+          # 从 GitHub 获取最新版
+          $converterUrl = "https://github.com/abbodi1406/BatUtil/raw/master/uup-converter-wimlib/uup-converter-wimlib.7z"
+          $converterPath = "$env:GITHUB_WORKSPACE\uup-converter-wimlib.7z"
+          
+          Write-Host "下载 uup-converter-wimlib..."
+          Invoke-WebRequest -Uri $converterUrl -OutFile $converterPath -MaximumRetryCount 3
+          
+          # 解压（需要 7z）
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+            $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          }
+          
+          & $sevenZip x $converterPath -o"$env:GITHUB_WORKSPACE\uup-converter-wimlib" -y
+          Remove-Item $converterPath
+          
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+
+      # ==========================================
+      # 7. 配置转换选项
+      # ==========================================
+      - name: Configure conversion options
+        shell: pwsh
+        run: |
+          $workDir = "$env:GITHUB_WORKSPACE\uup-work"
+          $converterDir = "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+          
+          # 创建 ConvertConfig.ini 配置文件
+          $config = @"
+          [Options]
+          ; 1 = WIM, 2 = ESD
+          Compress=$($env:USE_ESD -eq 'true' ? '2' : '1')
+          ; 集成更新
+          AddUpdates=$($env:INCLUDE_UPDATES -eq 'true' ? '1' : '0')
+          ; 清理组件
+          CleanupImage=$($env:CLEANUP -eq 'true' ? '1' : '0')
+          ; 集成 .NET 3.5
+          NetFx3=$($env:NETFX3 -eq 'true' ? '1' : '0')
+          ; 启动 ISO
+          StartISO=1
+          ; 保留临时文件（调试用）
+          Preserve=0
+          "@
+          
+          $config | Out-File -FilePath "$converterDir\ConvertConfig.ini" -Encoding UTF8
+          
+          Write-Host "转换配置:"
+          Get-Content "$converterDir\ConvertConfig.ini"
+
+      # ==========================================
+      # 8. 执行 UUP → ISO 转换
+      # ==========================================
+      - name: Convert UUP to ISO
+        shell: cmd
+        timeout-minutes: 90
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 运行转换脚本，传入 UUP 文件目录
+          call convert-UUP.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 9. 创建虚拟版本（Enterprise、Education、IoTEnterprise 等）
+      # ==========================================
+      - name: Create virtual editions
+        if: github.event.inputs.virtual_editions != ''
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 查找生成的 ISO 或 WIM 文件
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.iso) do set "SOURCE_ISO=%%f"
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.wim) do set "SOURCE_WIM=%%f"
+          
+          if defined SOURCE_ISO (
+            echo 找到源 ISO: %SOURCE_ISO%
+            REM create_virtual_editions 需要 WIM，如果源是 ISO 需要先提取
+          ) else if defined SOURCE_WIM (
+            echo 找到源 WIM: %SOURCE_WIM%
+            set "SOURCE_IMAGE=%SOURCE_WIM%"
+          )
+          
+          REM 运行虚拟版本创建脚本
+          REM 支持的虚拟版本: Enterprise, Education, IoTEnterprise, EnterpriseN, EducationN, etc.
+          call create_virtual_editions.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 10. 整理输出文件
+      # ==========================================
+      - name: Organize output
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          New-Item -ItemType Directory -Force -Path $outputDir
+          
+          # 移动所有 ISO 到输出目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work" -Filter "*.iso" | Move-Item -Destination $outputDir
+          
+          # 也检查 uup-converter-wimlib 目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib" -Filter "*.iso" -ErrorAction SilentlyContinue | Move-Item -Destination $outputDir
+          
+          # 计算 SHA256
+          Get-ChildItem $outputDir -Filter "*.iso" | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $($_.Name)" | Out-File -FilePath "$outputDir\$($_.BaseName).sha256.txt"
+          }
+          
+          Get-ChildItem $outputDir
+
+      # ==========================================
+      # 11. 分割 ISO（GitHub Release 单文件限制 2GB）
+      # ==========================================
+      - name: Split ISO for Release
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          $splitDir = "$env:GITHUB_WORKSPACE\split"
+          New-Item -ItemType Directory -Force -Path $splitDir
+          
+          $isos = Get-ChildItem $outputDir -Filter "*.iso"
+          foreach ($iso in $isos) {
+            $size = $iso.Length
+            if ($size -gt 2GB) {
+              Write-Host "分割 $($iso.Name) ($([math]::Round($size/1GB,2)) GB)..."
+              
+              # 使用 7z 分卷压缩，每卷 1900MB
+              $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+              & $sevenZip a -v1900m "$splitDir\$($iso.BaseName).7z" $iso.FullName
+              
+              # 同时保留原始 ISO 的 SHA256
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+              
+              # 创建合并脚本
+              $mergeScript = @"
+          @echo off
+          echo Merging $($iso.Name)...
+          copy /b "$($iso.BaseName).7z.001" + "$($iso.BaseName).7z.002" + "$($iso.BaseName).7z.003" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.004" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.004" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.005" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.005" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          echo Done: $($iso.Name)
+          pause
+          "@
+              $mergeScript | Out-File -FilePath "$splitDir\merge-$($iso.BaseName).bat" -Encoding OEM
+            } else {
+              # 小于 2GB 直接复制
+              Copy-Item $iso.FullName $splitDir
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+            }
+          }
+          
+          Get-ChildItem $splitDir
+
+      # ==========================================
+      # 12. 上传到 GitHub Release
+      # ==========================================
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: iso-${{ github.run_number }}-${{ steps.uup_query.outputs.build_num }}
+          name: "Windows ISO ${{ steps.uup_query.outputs.build_name }}"
+          body: |
+            ## Windows ISO 构建结果
+            
+            | 项目 | 值 |
+            |------|-----|
+            | 构建 | ${{ steps.uup_query.outputs.build_name }} |
+            | 架构 | ${{ github.event.inputs.architecture }} |
+            | 语言 | ${{ github.event.inputs.language }} |
+            | 基础版本 | ${{ github.event.inputs.base_edition }} |
+            | 虚拟版本 | ${{ github.event.inputs.virtual_editions }} |
+            | ESD 压缩 | ${{ github.event.inputs.use_esd }} |
+            | .NET 3.5 | ${{ github.event.inputs.netfx3 }} |
+            | 集成更新 | ${{ github.event.inputs.include_updates }} |
+            
+            ### 使用说明
+            
+            **如果 ISO 被分割：**
+            1. 下载所有 `.7z.00x` 文件
+            2. Windows: 双击 `merge-*.bat` 自动合并
+            3. 或使用 7-Zip 直接解压 `.7z.001` 文件
+            
+            **SHA256 校验：**
+            下载对应的 `.sha256.txt` 文件验证完整性。
+          files: |
+            split/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# .github/workflows/build-uup-iso.yml
+name: Build Windows ISO with Virtual Editions
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: '搜索关键词，如 "Windows 11 24H2" 或 "Windows 11 25H2"'
+        required: true
+        default: 'Windows 11 24H2'
+      architecture:
+        description: 'CPU 架构'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+      language:
+        description: '语言代码，如 zh-cn、en-us'
+        required: true
+        default: 'zh-cn'
+      base_edition:
+        description: '基础版本（决定下载哪个 UUP 包）'
+        required: true
+        default: 'Professional'
+        type: choice
+        options:
+          - Home
+          - Professional
+          - Home;Professional
+      virtual_editions:
+        description: '要创建的虚拟版本（用分号分隔，留空则只生成基础版本）'
+        required: false
+        default: 'Enterprise;Education;IoTEnterprise'
+      use_esd:
+        description: '使用 ESD 压缩（减小体积）'
+        type: boolean
+        default: true
+      netfx3:
+        description: '集成 .NET Framework 3.5'
+        type: boolean
+        default: false
+      include_updates:
+        description: '集成最新累积更新'
+        type: boolean
+        default: true
+      cleanup:
+        description: '转换后清理临时文件'
+        type: boolean
+        default: true
+
+jobs:
+  build-iso:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      # ==========================================
+      # 1. 环境准备
+      # ==========================================
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          # GitHub Windows runner 默认约 14GB 空闲，UUP 需要 20GB+
+          Write-Host "清理磁盘空间..."
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+          
+          # 删除不需要的大型组件
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Program Files\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Java_*"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Ruby"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\go"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\ProgramData\chocolatey\lib"
+          
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. 查询 UUP dump API 获取构建信息
+      # ==========================================
+      - name: Query UUP dump API
+        id: uup_query
+        shell: pwsh
+        run: |
+          $search = "${{ github.event.inputs.search_query }}"
+          $arch = "${{ github.event.inputs.architecture }}"
+          
+          Write-Host "搜索构建: $search, 架构: $arch"
+          
+          # 调用 listid API 搜索构建
+          $apiUrl = "https://api.uupdump.net/listid.php?search=" + [Uri]::EscapeDataString($search)
+          $response = Invoke-RestMethod -Uri $apiUrl -Method Get -MaximumRetryCount 3
+          
+          if ($response.responseJSON.builds.Count -eq 0) {
+            throw "未找到匹配的构建，请检查搜索关键词"
+          }
+          
+          # 筛选匹配的架构
+          $build = $response.responseJSON.builds | Where-Object { 
+            $_.architecture -eq $arch -or $arch -eq 'amd64' -and $_.architecture -eq 'x64'
+          } | Select-Object -First 1
+          
+          if (-not $build) {
+            $build = $response.responseJSON.builds | Select-Object -First 1
+          }
+          
+          $buildId = $build.updateId
+          $buildName = $build.title
+          $buildNum = $build.build
+          
+          Write-Host "找到构建: $buildName (ID: $buildId)"
+          Write-Output "build_id=$buildId" >> $env:GITHUB_OUTPUT
+          Write-Output "build_name=$buildName" >> $env:GITHUB_OUTPUT
+          Write-Output "build_num=$buildNum" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 3. 查询可用语言和版本
+      # ==========================================
+      - name: Verify language and edition
+        id: verify
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ github.event.inputs.language }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 查询可用语言
+          $langApi = "https://api.uupdump.net/listlangs.php?updateId=$buildId"
+          $langResp = Invoke-RestMethod -Uri $langApi -Method Get
+          $availableLangs = $langResp.responseJSON.langs
+          
+          if (-not ($availableLangs | Where-Object { $_.lang -eq $lang })) {
+            Write-Warning "语言 $lang 不可用，可用语言: $($availableLangs.lang -join ', ')"
+            throw "语言不可用"
+          }
+          
+          # 查询可用版本
+          $edApi = "https://api.uupdump.net/listeditions.php?lang=$lang&updateId=$buildId"
+          $edResp = Invoke-RestMethod -Uri $edApi -Method Get
+          $availableEds = $edResp.responseJSON.editions
+          
+          Write-Host "可用版本: $($availableEds -join ', ')"
+          
+          # 验证基础版本是否可用
+          $baseEds = $edition -split ';'
+          foreach ($ed in $baseEds) {
+            if (-not ($availableEds -contains $ed)) {
+              Write-Warning "版本 $ed 不可用"
+            }
+          }
+          
+          Write-Output "lang=$lang" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 4. 获取 UUP 下载包
+      # ==========================================
+      - name: Download UUP package
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ steps.verify.outputs.lang }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 调用 get API 获取下载包信息
+          $getApi = "https://api.uupdump.net/get.php?lang=$lang&edition=$edition&id=$buildId"
+          Write-Host "获取下载包: $getApi"
+          $getResp = Invoke-RestMethod -Uri $getApi -Method Get
+          
+          # 获取下载包 ZIP 的直链
+          $downloadUrl = $getResp.responseJSON.downloadUrl
+          if (-not $downloadUrl) {
+            # 备用：构造 uupdump.net 的下载链接
+            $downloadUrl = "https://uupdump.net/get.php?id=$buildId&pack=$lang&edition=$edition"
+          }
+          
+          Write-Host "下载包 URL: $downloadUrl"
+          
+          # 创建输出目录
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\uup-work"
+          Set-Location "$env:GITHUB_WORKSPACE\uup-work"
+          
+          # 下载 ZIP 包
+          $zipFile = "$env:GITHUB_WORKSPACE\uup-work\uup_download.zip"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile -MaximumRetryCount 3
+          
+          # 解压
+          Expand-Archive -Path $zipFile -DestinationPath "$env:GITHUB_WORKSPACE\uup-work" -Force
+          Remove-Item $zipFile
+          
+          # 列出解压后的文件
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work"
+
+      # ==========================================
+      # 5. 下载 UUP 文件
+      # ==========================================
+      - name: Download UUP files
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-work
+          
+          REM 查找下载脚本
+          if exist uup_download_windows.cmd (
+            call uup_download_windows.cmd
+          ) else if exist uup_download.cmd (
+            call uup_download.cmd
+          ) else (
+            echo 未找到下载脚本
+            dir
+            exit /b 1
+          )
+
+      # ==========================================
+      # 6. 下载 uup-converter-wimlib 工具
+      # ==========================================
+      - name: Download uup-converter-wimlib
+        shell: pwsh
+        run: |
+          # 从 GitHub 获取最新版
+          $converterUrl = "https://github.com/abbodi1406/BatUtil/raw/master/uup-converter-wimlib/uup-converter-wimlib.7z"
+          $converterPath = "$env:GITHUB_WORKSPACE\uup-converter-wimlib.7z"
+          
+          Write-Host "下载 uup-converter-wimlib..."
+          Invoke-WebRequest -Uri $converterUrl -OutFile $converterPath -MaximumRetryCount 3
+          
+          # 解压（需要 7z）
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+            $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          }
+          
+          & $sevenZip x $converterPath -o"$env:GITHUB_WORKSPACE\uup-converter-wimlib" -y
+          Remove-Item $converterPath
+          
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+
+      # ==========================================
+      # 7. 配置转换选项
+      # ==========================================
+      - name: Configure conversion options
+        shell: pwsh
+        run: |
+          $workDir = "$env:GITHUB_WORKSPACE\uup-work"
+          $converterDir = "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+          
+          # 创建 ConvertConfig.ini 配置文件
+          $config = @"
+          [Options]
+          ; 1 = WIM, 2 = ESD
+          Compress=$($env:USE_ESD -eq 'true' ? '2' : '1')
+          ; 集成更新
+          AddUpdates=$($env:INCLUDE_UPDATES -eq 'true' ? '1' : '0')
+          ; 清理组件
+          CleanupImage=$($env:CLEANUP -eq 'true' ? '1' : '0')
+          ; 集成 .NET 3.5
+          NetFx3=$($env:NETFX3 -eq 'true' ? '1' : '0')
+          ; 启动 ISO
+          StartISO=1
+          ; 保留临时文件（调试用）
+          Preserve=0
+          "@
+          
+          $config | Out-File -FilePath "$converterDir\ConvertConfig.ini" -Encoding UTF8
+          
+          Write-Host "转换配置:"
+          Get-Content "$converterDir\ConvertConfig.ini"
+
+      # ==========================================
+      # 8. 执行 UUP → ISO 转换
+      # ==========================================
+      - name: Convert UUP to ISO
+        shell: cmd
+        timeout-minutes: 90
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 运行转换脚本，传入 UUP 文件目录
+          call convert-UUP.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 9. 创建虚拟版本（Enterprise、Education、IoTEnterprise 等）
+      # ==========================================
+      - name: Create virtual editions
+        if: github.event.inputs.virtual_editions != ''
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 查找生成的 ISO 或 WIM 文件
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.iso) do set "SOURCE_ISO=%%f"
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.wim) do set "SOURCE_WIM=%%f"
+          
+          if defined SOURCE_ISO (
+            echo 找到源 ISO: %SOURCE_ISO%
+            REM create_virtual_editions 需要 WIM，如果源是 ISO 需要先提取
+          ) else if defined SOURCE_WIM (
+            echo 找到源 WIM: %SOURCE_WIM%
+            set "SOURCE_IMAGE=%SOURCE_WIM%"
+          )
+          
+          REM 运行虚拟版本创建脚本
+          REM 支持的虚拟版本: Enterprise, Education, IoTEnterprise, EnterpriseN, EducationN, etc.
+          call create_virtual_editions.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 10. 整理输出文件
+      # ==========================================
+      - name: Organize output
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          New-Item -ItemType Directory -Force -Path $outputDir
+          
+          # 移动所有 ISO 到输出目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work" -Filter "*.iso" | Move-Item -Destination $outputDir
+          
+          # 也检查 uup-converter-wimlib 目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib" -Filter "*.iso" -ErrorAction SilentlyContinue | Move-Item -Destination $outputDir
+          
+          # 计算 SHA256
+          Get-ChildItem $outputDir -Filter "*.iso" | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $($_.Name)" | Out-File -FilePath "$outputDir\$($_.BaseName).sha256.txt"
+          }
+          
+          Get-ChildItem $outputDir
+
+      # ==========================================
+      # 11. 分割 ISO（GitHub Release 单文件限制 2GB）
+      # ==========================================
+      - name: Split ISO for Release
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          $splitDir = "$env:GITHUB_WORKSPACE\split"
+          New-Item -ItemType Directory -Force -Path $splitDir
+          
+          $isos = Get-ChildItem $outputDir -Filter "*.iso"
+          foreach ($iso in $isos) {
+            $size = $iso.Length
+            if ($size -gt 2GB) {
+              Write-Host "分割 $($iso.Name) ($([math]::Round($size/1GB,2)) GB)..."
+              
+              # 使用 7z 分卷压缩，每卷 1900MB
+              $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+              & $sevenZip a -v1900m "$splitDir\$($iso.BaseName).7z" $iso.FullName
+              
+              # 同时保留原始 ISO 的 SHA256
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+              
+              # 创建合并脚本
+              $mergeScript = @"
+          @echo off
+          echo Merging $($iso.Name)...
+          copy /b "$($iso.BaseName).7z.001" + "$($iso.BaseName).7z.002" + "$($iso.BaseName).7z.003" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.004" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.004" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.005" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.005" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          echo Done: $($iso.Name)
+          pause
+          "@
+              $mergeScript | Out-File -FilePath "$splitDir\merge-$($iso.BaseName).bat" -Encoding OEM
+            } else {
+              # 小于 2GB 直接复制
+              Copy-Item $iso.FullName $splitDir
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+            }
+          }
+          
+          Get-ChildItem $splitDir
+
+      # ==========================================
+      # 12. 上传到 GitHub Release
+      # ==========================================
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: iso-${{ github.run_number }}-${{ steps.uup_query.outputs.build_num }}
+          name: "Windows ISO ${{ steps.uup_query.outputs.build_name }}"
+          body: |
+            ## Windows ISO 构建结果
+            
+            | 项目 | 值 |
+            |------|-----|
+            | 构建 | ${{ steps.uup_query.outputs.build_name }} |
+            | 架构 | ${{ github.event.inputs.architecture }} |
+            | 语言 | ${{ github.event.inputs.language }} |
+            | 基础版本 | ${{ github.event.inputs.base_edition }} |
+            | 虚拟版本 | ${{ github.event.inputs.virtual_editions }} |
+            | ESD 压缩 | ${{ github.event.inputs.use_esd }} |
+            | .NET 3.5 | ${{ github.event.inputs.netfx3 }} |
+            | 集成更新 | ${{ github.event.inputs.include_updates }} |
+            
+            ### 使用说明
+            
+            **如果 ISO 被分割：**
+            1. 下载所有 `.7z.00x` 文件
+            2. Windows: 双击 `merge-*.bat` 自动合并
+            3. 或使用 7-Zip 直接解压 `.7z.001` 文件
+            
+            **SHA256 校验：**
+            下载对应的 `.sha256.txt` 文件验证完整性。
+          files: |
+            split/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# .github/workflows/build-uup-iso.yml
+name: Build Windows ISO with Virtual Editions
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: '搜索关键词，如 "Windows 11 24H2" 或 "Windows 11 25H2"'
+        required: true
+        default: 'Windows 11 24H2'
+      architecture:
+        description: 'CPU 架构'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+      language:
+        description: '语言代码，如 zh-cn、en-us'
+        required: true
+        default: 'zh-cn'
+      base_edition:
+        description: '基础版本（决定下载哪个 UUP 包）'
+        required: true
+        default: 'Professional'
+        type: choice
+        options:
+          - Home
+          - Professional
+          - Home;Professional
+      virtual_editions:
+        description: '要创建的虚拟版本（用分号分隔，留空则只生成基础版本）'
+        required: false
+        default: 'Enterprise;Education;IoTEnterprise'
+      use_esd:
+        description: '使用 ESD 压缩（减小体积）'
+        type: boolean
+        default: true
+      netfx3:
+        description: '集成 .NET Framework 3.5'
+        type: boolean
+        default: false
+      include_updates:
+        description: '集成最新累积更新'
+        type: boolean
+        default: true
+      cleanup:
+        description: '转换后清理临时文件'
+        type: boolean
+        default: true
+
+jobs:
+  build-iso:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      # ==========================================
+      # 1. 环境准备
+      # ==========================================
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          # GitHub Windows runner 默认约 14GB 空闲，UUP 需要 20GB+
+          Write-Host "清理磁盘空间..."
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+          
+          # 删除不需要的大型组件
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Program Files\Android"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Java_*"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\Ruby"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\hostedtoolcache\windows\go"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\ProgramData\chocolatey\lib"
+          
+          Get-Volume | Where-Object { $_.DriveLetter -eq 'C' } | Select-Object SizeRemaining
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. 查询 UUP dump API 获取构建信息
+      # ==========================================
+      - name: Query UUP dump API
+        id: uup_query
+        shell: pwsh
+        run: |
+          $search = "${{ github.event.inputs.search_query }}"
+          $arch = "${{ github.event.inputs.architecture }}"
+          
+          Write-Host "搜索构建: $search, 架构: $arch"
+          
+          # 调用 listid API 搜索构建
+          $apiUrl = "https://api.uupdump.net/listid.php?search=" + [Uri]::EscapeDataString($search)
+          $response = Invoke-RestMethod -Uri $apiUrl -Method Get -MaximumRetryCount 3
+          
+          if ($response.responseJSON.builds.Count -eq 0) {
+            throw "未找到匹配的构建，请检查搜索关键词"
+          }
+          
+          # 筛选匹配的架构
+          $build = $response.responseJSON.builds | Where-Object { 
+            $_.architecture -eq $arch -or $arch -eq 'amd64' -and $_.architecture -eq 'x64'
+          } | Select-Object -First 1
+          
+          if (-not $build) {
+            $build = $response.responseJSON.builds | Select-Object -First 1
+          }
+          
+          $buildId = $build.updateId
+          $buildName = $build.title
+          $buildNum = $build.build
+          
+          Write-Host "找到构建: $buildName (ID: $buildId)"
+          Write-Output "build_id=$buildId" >> $env:GITHUB_OUTPUT
+          Write-Output "build_name=$buildName" >> $env:GITHUB_OUTPUT
+          Write-Output "build_num=$buildNum" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 3. 查询可用语言和版本
+      # ==========================================
+      - name: Verify language and edition
+        id: verify
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ github.event.inputs.language }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 查询可用语言
+          $langApi = "https://api.uupdump.net/listlangs.php?updateId=$buildId"
+          $langResp = Invoke-RestMethod -Uri $langApi -Method Get
+          $availableLangs = $langResp.responseJSON.langs
+          
+          if (-not ($availableLangs | Where-Object { $_.lang -eq $lang })) {
+            Write-Warning "语言 $lang 不可用，可用语言: $($availableLangs.lang -join ', ')"
+            throw "语言不可用"
+          }
+          
+          # 查询可用版本
+          $edApi = "https://api.uupdump.net/listeditions.php?lang=$lang&updateId=$buildId"
+          $edResp = Invoke-RestMethod -Uri $edApi -Method Get
+          $availableEds = $edResp.responseJSON.editions
+          
+          Write-Host "可用版本: $($availableEds -join ', ')"
+          
+          # 验证基础版本是否可用
+          $baseEds = $edition -split ';'
+          foreach ($ed in $baseEds) {
+            if (-not ($availableEds -contains $ed)) {
+              Write-Warning "版本 $ed 不可用"
+            }
+          }
+          
+          Write-Output "lang=$lang" >> $env:GITHUB_OUTPUT
+
+      # ==========================================
+      # 4. 获取 UUP 下载包
+      # ==========================================
+      - name: Download UUP package
+        shell: pwsh
+        run: |
+          $buildId = "${{ steps.uup_query.outputs.build_id }}"
+          $lang = "${{ steps.verify.outputs.lang }}"
+          $edition = "${{ github.event.inputs.base_edition }}"
+          
+          # 调用 get API 获取下载包信息
+          $getApi = "https://api.uupdump.net/get.php?lang=$lang&edition=$edition&id=$buildId"
+          Write-Host "获取下载包: $getApi"
+          $getResp = Invoke-RestMethod -Uri $getApi -Method Get
+          
+          # 获取下载包 ZIP 的直链
+          $downloadUrl = $getResp.responseJSON.downloadUrl
+          if (-not $downloadUrl) {
+            # 备用：构造 uupdump.net 的下载链接
+            $downloadUrl = "https://uupdump.net/get.php?id=$buildId&pack=$lang&edition=$edition"
+          }
+          
+          Write-Host "下载包 URL: $downloadUrl"
+          
+          # 创建输出目录
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\uup-work"
+          Set-Location "$env:GITHUB_WORKSPACE\uup-work"
+          
+          # 下载 ZIP 包
+          $zipFile = "$env:GITHUB_WORKSPACE\uup-work\uup_download.zip"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile -MaximumRetryCount 3
+          
+          # 解压
+          Expand-Archive -Path $zipFile -DestinationPath "$env:GITHUB_WORKSPACE\uup-work" -Force
+          Remove-Item $zipFile
+          
+          # 列出解压后的文件
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work"
+
+      # ==========================================
+      # 5. 下载 UUP 文件
+      # ==========================================
+      - name: Download UUP files
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-work
+          
+          REM 查找下载脚本
+          if exist uup_download_windows.cmd (
+            call uup_download_windows.cmd
+          ) else if exist uup_download.cmd (
+            call uup_download.cmd
+          ) else (
+            echo 未找到下载脚本
+            dir
+            exit /b 1
+          )
+
+      # ==========================================
+      # 6. 下载 uup-converter-wimlib 工具
+      # ==========================================
+      - name: Download uup-converter-wimlib
+        shell: pwsh
+        run: |
+          # 从 GitHub 获取最新版
+          $converterUrl = "https://github.com/abbodi1406/BatUtil/raw/master/uup-converter-wimlib/uup-converter-wimlib.7z"
+          $converterPath = "$env:GITHUB_WORKSPACE\uup-converter-wimlib.7z"
+          
+          Write-Host "下载 uup-converter-wimlib..."
+          Invoke-WebRequest -Uri $converterUrl -OutFile $converterPath -MaximumRetryCount 3
+          
+          # 解压（需要 7z）
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+            $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          }
+          
+          & $sevenZip x $converterPath -o"$env:GITHUB_WORKSPACE\uup-converter-wimlib" -y
+          Remove-Item $converterPath
+          
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+
+      # ==========================================
+      # 7. 配置转换选项
+      # ==========================================
+      - name: Configure conversion options
+        shell: pwsh
+        run: |
+          $workDir = "$env:GITHUB_WORKSPACE\uup-work"
+          $converterDir = "$env:GITHUB_WORKSPACE\uup-converter-wimlib"
+          
+          # 创建 ConvertConfig.ini 配置文件
+          $config = @"
+          [Options]
+          ; 1 = WIM, 2 = ESD
+          Compress=$($env:USE_ESD -eq 'true' ? '2' : '1')
+          ; 集成更新
+          AddUpdates=$($env:INCLUDE_UPDATES -eq 'true' ? '1' : '0')
+          ; 清理组件
+          CleanupImage=$($env:CLEANUP -eq 'true' ? '1' : '0')
+          ; 集成 .NET 3.5
+          NetFx3=$($env:NETFX3 -eq 'true' ? '1' : '0')
+          ; 启动 ISO
+          StartISO=1
+          ; 保留临时文件（调试用）
+          Preserve=0
+          "@
+          
+          $config | Out-File -FilePath "$converterDir\ConvertConfig.ini" -Encoding UTF8
+          
+          Write-Host "转换配置:"
+          Get-Content "$converterDir\ConvertConfig.ini"
+
+      # ==========================================
+      # 8. 执行 UUP → ISO 转换
+      # ==========================================
+      - name: Convert UUP to ISO
+        shell: cmd
+        timeout-minutes: 90
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 运行转换脚本，传入 UUP 文件目录
+          call convert-UUP.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 9. 创建虚拟版本（Enterprise、Education、IoTEnterprise 等）
+      # ==========================================
+      - name: Create virtual editions
+        if: github.event.inputs.virtual_editions != ''
+        shell: cmd
+        timeout-minutes: 60
+        run: |
+          cd /d %GITHUB_WORKSPACE%\uup-converter-wimlib
+          
+          REM 查找生成的 ISO 或 WIM 文件
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.iso) do set "SOURCE_ISO=%%f"
+          for %%f in (%GITHUB_WORKSPACE%\uup-work\*.wim) do set "SOURCE_WIM=%%f"
+          
+          if defined SOURCE_ISO (
+            echo 找到源 ISO: %SOURCE_ISO%
+            REM create_virtual_editions 需要 WIM，如果源是 ISO 需要先提取
+          ) else if defined SOURCE_WIM (
+            echo 找到源 WIM: %SOURCE_WIM%
+            set "SOURCE_IMAGE=%SOURCE_WIM%"
+          )
+          
+          REM 运行虚拟版本创建脚本
+          REM 支持的虚拟版本: Enterprise, Education, IoTEnterprise, EnterpriseN, EducationN, etc.
+          call create_virtual_editions.cmd %GITHUB_WORKSPACE%\uup-work
+
+      # ==========================================
+      # 10. 整理输出文件
+      # ==========================================
+      - name: Organize output
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          New-Item -ItemType Directory -Force -Path $outputDir
+          
+          # 移动所有 ISO 到输出目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-work" -Filter "*.iso" | Move-Item -Destination $outputDir
+          
+          # 也检查 uup-converter-wimlib 目录
+          Get-ChildItem "$env:GITHUB_WORKSPACE\uup-converter-wimlib" -Filter "*.iso" -ErrorAction SilentlyContinue | Move-Item -Destination $outputDir
+          
+          # 计算 SHA256
+          Get-ChildItem $outputDir -Filter "*.iso" | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $($_.Name)" | Out-File -FilePath "$outputDir\$($_.BaseName).sha256.txt"
+          }
+          
+          Get-ChildItem $outputDir
+
+      # ==========================================
+      # 11. 分割 ISO（GitHub Release 单文件限制 2GB）
+      # ==========================================
+      - name: Split ISO for Release
+        shell: pwsh
+        run: |
+          $outputDir = "$env:GITHUB_WORKSPACE\output"
+          $splitDir = "$env:GITHUB_WORKSPACE\split"
+          New-Item -ItemType Directory -Force -Path $splitDir
+          
+          $isos = Get-ChildItem $outputDir -Filter "*.iso"
+          foreach ($iso in $isos) {
+            $size = $iso.Length
+            if ($size -gt 2GB) {
+              Write-Host "分割 $($iso.Name) ($([math]::Round($size/1GB,2)) GB)..."
+              
+              # 使用 7z 分卷压缩，每卷 1900MB
+              $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+              & $sevenZip a -v1900m "$splitDir\$($iso.BaseName).7z" $iso.FullName
+              
+              # 同时保留原始 ISO 的 SHA256
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+              
+              # 创建合并脚本
+              $mergeScript = @"
+          @echo off
+          echo Merging $($iso.Name)...
+          copy /b "$($iso.BaseName).7z.001" + "$($iso.BaseName).7z.002" + "$($iso.BaseName).7z.003" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.004" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.004" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          if exist "$($iso.BaseName).7z.005" copy /b "$($iso.Name)" + "$($iso.BaseName).7z.005" "$($iso.Name).tmp" & move /y "$($iso.Name).tmp" "$($iso.Name)" 2>nul
+          echo Done: $($iso.Name)
+          pause
+          "@
+              $mergeScript | Out-File -FilePath "$splitDir\merge-$($iso.BaseName).bat" -Encoding OEM
+            } else {
+              # 小于 2GB 直接复制
+              Copy-Item $iso.FullName $splitDir
+              Copy-Item "$outputDir\$($iso.BaseName).sha256.txt" $splitDir
+            }
+          }
+          
+          Get-ChildItem $splitDir
+
+      # ==========================================
+      # 12. 上传到 GitHub Release
+      # ==========================================
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: iso-${{ github.run_number }}-${{ steps.uup_query.outputs.build_num }}
+          name: "Windows ISO ${{ steps.uup_query.outputs.build_name }}"
+          body: |
+            ## Windows ISO 构建结果
+            
+            | 项目 | 值 |
+            |------|-----|
+            | 构建 | ${{ steps.uup_query.outputs.build_name }} |
+            | 架构 | ${{ github.event.inputs.architecture }} |
+            | 语言 | ${{ github.event.inputs.language }} |
+            | 基础版本 | ${{ github.event.inputs.base_edition }} |
+            | 虚拟版本 | ${{ github.event.inputs.virtual_editions }} |
+            | ESD 压缩 | ${{ github.event.inputs.use_esd }} |
+            | .NET 3.5 | ${{ github.event.inputs.netfx3 }} |
+            | 集成更新 | ${{ github.event.inputs.include_updates }} |
+            
+            ### 使用说明
+            
+            **如果 ISO 被分割：**
+            1. 下载所有 `.7z.00x` 文件
+            2. Windows: 双击 `merge-*.bat` 自动合并
+            3. 或使用 7-Zip 直接解压 `.7z.001` 文件
+            
+            **SHA256 校验：**
+            下载对应的 `.sha256.txt` 文件验证完整性。
+          files: |
+            split/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
